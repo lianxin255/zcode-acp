@@ -686,6 +686,79 @@ async function emitAskToolCall(
   });
 }
 
+/**
+ * One candidate row for the `/resume` session picker.
+ */
+export interface SessionPickItem {
+  /** Backend (zcode) session id — the value returned on selection. */
+  sessionId: string;
+  /** Human label (title + date) shown in the dropdown / popup. */
+  label: string;
+}
+
+/**
+ * `/resume` session picker: ask the user to choose a past session via the
+ * editor's interaction UI — an `elicitation/create` enum dropdown when the
+ * client supports forms, else `session/request_permission` option buttons.
+ * Returns the chosen backend session id, or null when declined/cancelled or
+ * the request failed (no turn context — the slash path has no PendingTurn).
+ */
+export async function askSessionPick(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  items: SessionPickItem[],
+): Promise<string | null> {
+  if (items.length === 0) return null;
+  if (server.supportsElicitationForm()) {
+    const resp = await requestWithTimeout(
+      server,
+      cx,
+      "elicitation/create",
+      {
+        mode: "form",
+        message: messages().slashResumePickTitle,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            session: {
+              type: "string",
+              title: messages().slashResumePickTitle,
+              // oneOf (const+title) renders a titled dropdown in Zed — the
+              // raw session ids stay values, the labels stay visible.
+              oneOf: items.map((i) => ({ const: i.sessionId, title: i.label })),
+            },
+          },
+          required: ["session"],
+        },
+      },
+      "session pick (elicitation)",
+    );
+    if (resp === null || resp === INTERRUPTED) return null;
+    const picked = (resp as { content?: { session?: unknown } }).content?.session;
+    // Only accept a value we offered — a free-form answer can't name a row.
+    if (typeof picked === "string" && items.some((i) => i.sessionId === picked)) return picked;
+    return null;
+  }
+  const options = items.map((i) => ({
+    kind: "allow_once" as const,
+    name: i.label,
+    optionId: i.sessionId,
+  }));
+  const resp = await requestWithTimeout(
+    server,
+    cx,
+    "session/request_permission",
+    { options, sessionId: acpSid, toolCall: { toolCallId: "resume_pick", rawInput: {} } },
+    "session pick (permission)",
+  );
+  if (resp === null || resp === INTERRUPTED) return null;
+  const optionId = (resp as { outcome?: { outcome?: string; optionId?: string } }).outcome
+    ?.optionId;
+  if (optionId && items.some((i) => i.sessionId === optionId)) return optionId;
+  return null;
+}
+
 /** Send one requestPermission and await the response. */
 async function askOnce(
   server: ZcodeAcpServer,

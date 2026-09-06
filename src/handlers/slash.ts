@@ -45,6 +45,20 @@ import { CONFIG_DISPATCH, SLASH_COMMANDS, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { sendTextChunk } from "./io.js";
 import { compact, fork, goal } from "./extensions.js";
+import { listSessions, resumeIntoSession } from "./session.js";
+import { askSessionPick, type SessionPickItem } from "./server-requests.js";
+
+/** Rows offered by the /resume picker (newest first). */
+const RESUME_PICK_LIMIT = 10;
+
+/** `/resume` label: "title · YYYY-MM-DD HH:mm" (untitled sessions get a dash). */
+function resumeLabel(
+  title: string | null | undefined,
+  updatedAt: string | null | undefined,
+): string {
+  const when = updatedAt ? updatedAt.slice(0, 16).replace("T", " ") : "?";
+  return `${title && title.trim() ? title.trim() : "(untitled)"} · ${when}`;
+}
 
 /**
  * ZCode built-in commands that require the TUI command center or interactive
@@ -57,7 +71,6 @@ const UNSUPPORTED_TUI_COMMANDS = new Set([
   "login",
   "logout",
   "new",
-  "resume",
   "locale",
   "expert",
   "workflow",
@@ -187,6 +200,35 @@ export async function handleSlashCommand(
           forkedSessionId?: string;
         };
         return ok(messages().slashForked(result.forkedSessionId ?? "?"));
+      }
+      case "resume": {
+        // Candidate list: this thread's workspace, minus the live/running
+        // sessions (an adopted conversation must be at rest) and the thread's
+        // own session. `/resume <sessionId>` skips the popup and adopts that
+        // id directly (still subject to the empty-thread guard).
+        const cwd = server.sessionCwds.get(acpSid) ?? undefined;
+        const { sessions } = await listSessions(server, { cwd });
+        const running = new Set([...server.pendingTurns.values()].map((t) => t.zcodeSid));
+        const currentSid = server.resolveSid(acpSid);
+        const resumable = sessions
+          .filter((s) => s.sessionId && s.sessionId !== currentSid && !running.has(s.sessionId))
+          .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+        const target = arg ? (sessions.find((s) => s.sessionId === arg)?.sessionId ?? null) : null;
+        if (arg && !target) throw new RequestError(-32602, messages().slashErrResumeArg(arg));
+        let chosen: string | null = target ?? null;
+        if (!chosen) {
+          if (resumable.length === 0) return ok(messages().slashResumeNone);
+          const items: SessionPickItem[] = resumable.slice(0, RESUME_PICK_LIMIT).map((s) => ({
+            sessionId: s.sessionId,
+            label: resumeLabel(s.title, s.updatedAt),
+          }));
+          const picked = await askSessionPick(server, cx, acpSid, items);
+          if (!picked) return ok(messages().slashResumeCancelled);
+          chosen = picked;
+        }
+        const result = await resumeIntoSession(server, cx, acpSid, chosen);
+        if (!result.ok) return ok(result.error);
+        return ok(messages().slashResumed(result.title ?? chosen));
       }
       case "model": {
         if (!arg) throw new RequestError(-32602, messages().slashErrModelArg);

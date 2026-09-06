@@ -128,6 +128,15 @@ export interface Messages {
   slashForked: (sessionId: string) => string;
   slashModelSet: (value: string) => string;
   slashTuiOnly: (cmd: string) => string;
+  /** /resume (adopt a past session into this editor thread). */
+  slashResumePickTitle: string;
+  slashResumeNone: string;
+  slashResumeCancelled: string;
+  slashResumeBusy: string;
+  slashResumeNotEmpty: string;
+  slashResumeFailed: string;
+  slashResumed: (title: string) => string;
+  slashErrResumeArg: (arg: string) => string;
   /** Collapsed tool-call titles during session/load replay. */
   replayCompactSummary: string;
   replayContextHandoff: string;
@@ -217,6 +226,14 @@ const zh: Messages = {
   slashForked: (id) => `✓ 已分叉新会话：${id}`,
   slashModelSet: (v) => `✓ 模型 = ${v}`,
   slashTuiOnly: (cmd) => `⚠ /${cmd} 在 ACP 模式下不可用（需要 ZCode TUI）`,
+  slashResumePickTitle: "选择要接续的会话",
+  slashResumeNone: "没有可接续的历史会话",
+  slashResumeCancelled: "已取消接续",
+  slashResumeBusy: "⚠ 会话有正在运行的回复——先等它结束或取消",
+  slashResumeNotEmpty: "⚠ 当前线程已有对话，无法接续——请新开线程再使用 /resume",
+  slashResumeFailed: "⚠ 接续失败（后端 resume 出错）——会话保持原状",
+  slashResumed: (t) => `✓ 已接续会话：${t}`,
+  slashErrResumeArg: (a) => `⚠ 找不到会话 ${a}——用 /resume 查看可选列表`,
   replayCompactSummary: "压缩摘要",
   replayContextHandoff: "上下文交接",
   replayToolFallback: (tool) => `${tool} 工具`,
@@ -235,6 +252,7 @@ const zh: Messages = {
     model: "切换会话模型",
     thought: "设置思考深度",
     quota: "查看剩余用量配额（5 小时 / 周 / MCP）",
+    resume: "在当前线程接续一个历史会话（弹窗选择）",
     mcp: "列出可用的 MCP 服务器",
     init: "创建或更新工作区 AGENTS.md 指令",
   },
@@ -311,6 +329,15 @@ const en: Messages = {
   slashForked: (id) => `✓ forked new session: ${id}`,
   slashModelSet: (v) => `✓ model = ${v}`,
   slashTuiOnly: (cmd) => `⚠ /${cmd} is not available in ACP mode (requires ZCode TUI)`,
+  slashResumePickTitle: "Choose a session to resume",
+  slashResumeNone: "no past sessions available to resume",
+  slashResumeCancelled: "resume cancelled",
+  slashResumeBusy: "⚠ a reply is still running on this session — wait or cancel it first",
+  slashResumeNotEmpty:
+    "⚠ this thread already has a conversation — open a new thread before /resume",
+  slashResumeFailed: "⚠ resume failed (backend error) — the thread is unchanged",
+  slashResumed: (t) => `✓ resumed session: ${t}`,
+  slashErrResumeArg: (a) => `⚠ session ${a} not found — run /resume to list candidates`,
   replayCompactSummary: "Compact summary",
   replayContextHandoff: "Context handoff",
   replayToolFallback: (tool) => `${tool} tool`,
@@ -329,6 +356,7 @@ const en: Messages = {
     model: "Switch the session model",
     thought: "Set the reasoning effort",
     quota: "Show remaining usage quota (5h / weekly / MCP)",
+    resume: "Resume a past session into this thread (picker popup)",
     mcp: "List available MCP servers",
     init: "Create or update workspace AGENTS.md instructions",
   },

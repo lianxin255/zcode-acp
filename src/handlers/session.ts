@@ -786,6 +786,114 @@ export async function resumeSession(
 }
 
 /**
+ * `/resume` slash command: rebind the CURRENT ACP session (an editor thread)
+ * to an existing backend session and replay its history into that thread —
+ * the editor-side path for adopting a conversation started elsewhere (TUI /
+ * App), complementing Zed's Import Threads (which needs a manual import
+ * step). Only an EMPTY thread may adopt: a thread that already has a
+ * conversation can neither merge nor replace history cleanly (the editor has
+ * already rendered its own copy).
+ *
+ * Mirrors the alreadyLive-branch tail of `session/load`: provider registry →
+ * faithful resume → mapping + cwd → title adoption → full-history replay →
+ * differ baseline + plan/usage emission.
+ */
+export async function resumeIntoSession(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  zcodeTarget: string,
+): Promise<{ ok: true; title: string | undefined } | { ok: false; error: string }> {
+  // A turn running on either end of the rebind would race the replay.
+  const busySid = [...server.pendingTurns.values()].some(
+    (t) => t.zcodeSid === zcodeTarget || t.zcodeSid === server.resolveSid(acpSid),
+  );
+  if (busySid) return { ok: false, error: messages().slashResumeBusy };
+
+  if (!server.pendingSessions.has(acpSid)) {
+    const current = server.resolveSid(acpSid);
+    if (current === zcodeTarget) return { ok: true, title: server.sessionTitles.get(acpSid) };
+    if (current) {
+      let existing: Awaited<ReturnType<typeof fetchMessages>>;
+      try {
+        existing = await fetchMessages(server, current);
+      } catch {
+        // Cannot prove the thread empty — refuse rather than orphan history.
+        return { ok: false, error: messages().slashResumeNotEmpty };
+      }
+      if (existing.length > 0) return { ok: false, error: messages().slashResumeNotEmpty };
+      // Materialized but empty: discard the orphan backend session and the
+      // stale mappings before adopting the target.
+      try {
+        server.ensureBackend().send("session/close", { sessionId: current });
+      } catch (e) {
+        log(
+          `/resume: closing empty session ${current} failed (ignored): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      server.sessionMap.delete(acpSid);
+      server.acpSidByZcodeSid.delete(current);
+      server.backendLoadedSessions.delete(acpSid);
+    }
+  } else {
+    // Never-materialized placeholder: the lazy record re-attaches below via
+    // recordMaterializedSession; drop the pending entry so nothing creates a
+    // fresh backend session on a later first-use path.
+    server.pendingSessions.delete(acpSid);
+  }
+  // The adopted session's stored title wins over the placeholder's first-
+  // prompt auto-title.
+  server.titleEligibleSessions.delete(acpSid);
+
+  const cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
+  try {
+    await syncProviderRegistry(server, cwd);
+    const resumeResult = await resumePreservingModel(server, {
+      sessionId: zcodeTarget,
+      workspace: workspaceFor(cwd),
+    });
+    server.markBackendLoaded(acpSid);
+    await repairUnavailableModel(server, zcodeTarget);
+    server.registerSession(acpSid, zcodeTarget);
+    const backendWs = workspaceFromResumeResult(resumeResult);
+    const finalCwd = backendWs && !server.serveMode ? backendWs : cwd;
+    server.sessionCwds.set(acpSid, finalCwd);
+    recordMaterializedSession(acpSid, zcodeTarget, finalCwd);
+    server.ensureBackgroundListener(zcodeTarget);
+    await adoptStoredTitle(server, acpSid, zcodeTarget);
+  } catch (e) {
+    warn(`/resume: adopting ${zcodeTarget} failed: ${e instanceof Error ? e.message : String(e)}`);
+    return { ok: false, error: messages().slashResumeFailed };
+  }
+
+  const history = await fetchMessages(server, zcodeTarget);
+  if (history.length > 0) server.markSessionActive(acpSid);
+  const slice = fullSlice(history);
+  await withReplayBatch(acpSid, () => replayMessages(cx, acpSid, slice.batch));
+  log(`/resume: replayed ${slice.meta.replayedMessages} messages into ${acpSid.slice(0, 8)}`);
+
+  // Same baseline dance as session/load: mark history seen so the next turn's
+  // completion diff does not re-emit it, then emit the current todos from a
+  // throwaway differ and the initial context-usage bar.
+  try {
+    const snapshot = await buildSnapshot(server, zcodeTarget);
+    getOrCreateDiffer(server, zcodeTarget).diff(snapshot);
+    const planEvents = new ProjectionDiffer().diffPlan(snapshot.todos ?? []);
+    for (const iev of planEvents) {
+      await dispatchEvent(server, cx, acpSid, iev, `resume_${randomUUID().slice(0, 8)}`);
+    }
+  } catch (e) {
+    log(
+      `/resume: initial plan read failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  await emitInitialUsage(server, cx, acpSid, zcodeTarget, getOrCreateDiffer(server, zcodeTarget));
+
+  return { ok: true, title: server.sessionTitles.get(acpSid) };
+}
+
+/**
  * `session/load` → zcode `session/resume` + stream conversation history back as
  * `session/update` notifications (text/reasoning/简化 tool_call).
  */
