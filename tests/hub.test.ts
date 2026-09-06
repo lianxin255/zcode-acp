@@ -4,6 +4,7 @@
  * idle-exit policy.
  */
 
+import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -1876,5 +1877,122 @@ describe("terminal TUI script (ADR-0016)", () => {
     expect(body).toContain("export ZCODE_ACP_REMOTE_ORIGIN='serve'");
     expect(body).toContain("exec '");
     expect(body).not.toContain("PATH=");
+  });
+});
+
+describe("hub instance shutdown", () => {
+  /** A real killable placeholder process standing in for a serve bridge. */
+  async function startDummyBridge(): Promise<{ child: ChildProcess; pid: number }> {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve) => {
+      if (child.pid) resolve();
+      else child.once("spawn", () => resolve());
+    });
+    cleanups.push(() => {
+      child.kill("SIGKILL");
+    });
+    return { child, pid: child.pid! };
+  }
+
+  async function registerInstance(
+    hub: HubHandle,
+    pid: number,
+    overrides: Record<string, unknown> = {},
+  ): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ pid, ...overrides })),
+    });
+    expect(res.status).toBe(200);
+  }
+
+  async function shutdown(hub: HubHandle, id = "inst-1"): Promise<Response> {
+    return fetch(`http://127.0.0.1:${hub.port}/api/instances/${id}/shutdown`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+  }
+
+  it("kills a serve-origin bridge and unregisters it", async () => {
+    const hub = await startTestHub();
+    const { child, pid } = await startDummyBridge();
+    await registerInstance(hub, pid, { origin: "serve" });
+
+    const res = await shutdown(hub);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+
+    // SIGTERM'd → the process exits and the instance leaves the registry.
+    await withTimeout(
+      new Promise<void>((resolve) => child.once("exit", () => resolve())),
+      5000,
+      "dummy bridge exit",
+    );
+    const list = await (await listInstances(hub)).json();
+    expect(list).toHaveLength(0);
+  });
+
+  it("kills an editor-origin bridge that carries an incubation nonce", async () => {
+    const hub = await startTestHub();
+    const { child, pid } = await startDummyBridge();
+    await registerInstance(hub, pid, { origin: "editor", nonce: "nonce-1" });
+
+    expect((await shutdown(hub)).status).toBe(200);
+    await withTimeout(
+      new Promise<void>((resolve) => child.once("exit", () => resolve())),
+      5000,
+      "dummy bridge exit",
+    );
+  });
+
+  it("refuses an editor-origin bridge without a nonce (403)", async () => {
+    const hub = await startTestHub();
+    const { child, pid } = await startDummyBridge();
+    await registerInstance(hub, pid, { origin: "editor" }); // no nonce
+
+    const res = await shutdown(hub);
+    expect(res.status).toBe(403);
+    expect(child.exitCode).toBeNull(); // still alive
+  });
+
+  it("guards auth and unknown instances like the other write routes", async () => {
+    const hub = await startTestHub();
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/shutdown`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(401); // no token
+    expect((await shutdown(hub)).status).toBe(404); // unknown instance
+    // Non-POST falls through to the catch-all 404.
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/shutdown`, {
+          headers: { Authorization: `Bearer ${TOKEN}` },
+        })
+      ).status,
+    ).toBe(404);
+  });
+});
+
+describe("hub instance shutdown pid guard", () => {
+  it("refuses a registration that carries no usable pid (409, nothing killed)", async () => {
+    const hub = await startTestHub();
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ pid: 0, origin: "serve" })),
+    });
+
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/shutdown`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.status).toBe(409);
+    expect(process.pid).toBeTruthy(); // we are still here
   });
 });

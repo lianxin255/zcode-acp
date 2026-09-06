@@ -1504,6 +1504,59 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       req.on("close", () => upstream.destroy());
       return;
     }
+    // POST /api/instances/{id}/shutdown — terminate an APP-incubated bridge
+    // (ADR-0016/0017): remote "close session window". Only instances this
+    // hub (or a remote app via it) brought up may be killed — a serve-origin
+    // bridge or any incubation-nonce carrier. An editor-origin bridge
+    // without a nonce lives inside the user's editor; killing it would take
+    // the editor's agent connection down, so those are refused (403).
+    const shutdownMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/shutdown$/);
+    if (shutdownMatch && req.method === "POST") {
+      req.resume(); // no body — drain so the client connection closes cleanly
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(shutdownMatch[1]!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      if (entry.origin !== "serve" && !entry.nonce) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("instance was not incubated remotely (editor bridge) — refusing shutdown");
+        return;
+      }
+      // Degenerate pids from a malformed registration must never reach kill():
+      // pid 0 signals the hub's own process group and pid 1 the launchd root.
+      if (!Number.isInteger(entry.pid) || entry.pid <= 1 || entry.pid === process.pid) {
+        res.writeHead(409, { "Content-Type": "text/plain" });
+        res.end(`instance has no killable pid (${entry.pid})`);
+        return;
+      }
+      try {
+        process.kill(entry.pid, "SIGTERM");
+      } catch (e) {
+        // ESRCH = already gone; anything else is a real failure to report.
+        if ((e as NodeJS.ErrnoException).code !== "ESRCH") {
+          warn(
+            `hub: shutdown of instance ${entry.id} (pid ${entry.pid}) failed: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+          );
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("kill failed");
+          return;
+        }
+      }
+      instances.delete(entry.id);
+      idleSince = null; // re-arm the idle clock on membership change
+      log(`hub: instance ${entry.id} (pid ${entry.pid}) shut down from remote`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
     // POST /api/instances/{id}/sessions/{sid}/close|rename — the remote HTTP
     // write surface (ADR-0006): forward-and-relay to the bridge's loopback
     // route. The hub still routes by instance id only; semantics (running

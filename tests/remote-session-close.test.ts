@@ -96,6 +96,35 @@ describe("session close endpoint", () => {
     expect((await fetch(`${base}/sessions/whatever/close`)).status).toBe(405);
   });
 
+  it("evicts the backend resident runtime (session/close) and clears the liveness cache", async () => {
+    const server = new ZcodeAcpServer();
+    const { acpSid, zcodeSid } = seedSession(server);
+    const sent: Array<{ method: string; params: unknown }> = [];
+    server.backend = {
+      isDead: false,
+      send: (method: string, params: unknown) => sent.push({ method, params }),
+    } as unknown as typeof server.backend;
+    server.markBackendLoaded(acpSid);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(sent).toEqual([{ method: "session/close", params: { sessionId: zcodeSid } }]);
+    // Stale "still loaded" trust must go, or a later resume would skip the
+    // backend's session/resume RPC.
+    expect(server.isBackendSessionLive(acpSid)).toBe(false);
+  });
+
+  it("closes without a live backend (no spawn, discovery still retired)", async () => {
+    const server = new ZcodeAcpServer();
+    const { acpSid } = seedSession(server);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(server.backend).toBeNull(); // close never spawned one
+  });
+
   it("a closed session reappears once the editor touches it again (self-healing)", async () => {
     const server = new ZcodeAcpServer();
     const { acpSid, zcodeSid } = seedSession(server, { title: "still open in editor" });

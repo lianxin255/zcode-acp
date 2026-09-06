@@ -254,7 +254,7 @@ export class ZcodeAcpServer {
    * for those (the replay would silently come back empty). Use
    * `markBackendLoaded`/`isBackendSessionLive` instead of touching the map.
    */
-  private readonly backendLoadedSessions = new Map<string, number>();
+  readonly backendLoadedSessions = new Map<string, number>();
   /**
    * Sessions eligible for the one-shot auto-title. Only `session/new`
    * populates this — resumed/loaded sessions already carry a title, so their
