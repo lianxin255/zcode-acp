@@ -404,7 +404,13 @@ function appleScriptString(s: string): string {
 export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
   return [
     `tell application ${appleScriptString(app)}`,
+    // activate requires live GUI-session focus — while the screen is LOCKED it
+    // fails ("permission violation" -10004) and aborts the whole tell block,
+    // so the tab never opens (remote create/resume died on every locked
+    // screen). Best-effort: new tab itself needs no activation.
+    "try",
     "activate",
+    "end try",
     "if (count of windows) = 0 then",
     "set tgt to new window",
     "else",

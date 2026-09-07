@@ -1865,6 +1865,9 @@ describe("terminal launch resolution (ADR-0016)", () => {
   it("ghostty rides AppleScript: new tab in the front window, prompt-free command", () => {
     const src = ghosttyTabAppleScript("Ghostty", '/ws/.zcode/tmp/tui-ab12"cd.command');
     expect(src).toContain('tell application "Ghostty"');
+    // activate is best-effort (try): on a LOCKED screen it fails with a
+    // permission violation and would otherwise abort the whole tell block.
+    expect(src).toContain("try\nactivate\nend try");
     // No windows → a fresh one; otherwise reuse the front window (no -n spawn).
     expect(src).toContain("if (count of windows) = 0 then");
     expect(src).toContain("set tgt to front window");
