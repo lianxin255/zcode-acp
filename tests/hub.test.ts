@@ -44,6 +44,7 @@ import {
   sanitizeTabTitle,
   startHub,
   terminalTuiScript,
+  ghosttyTabAppleScript,
   type HubHandle,
 } from "../src/remote/hub-server.js";
 import { BOOT_RESUME_TRIGGER } from "../src/handlers/session.js";
@@ -1809,9 +1810,8 @@ describe("terminal launch resolution (ADR-0016)", () => {
       args: [],
     });
     expect(resolveTerminalLaunch({}, { app: "ghostty" }).launch).toEqual({
-      kind: "openAppArgs",
+      kind: "ghosttyScript",
       app: "Ghostty",
-      args: ["-e"],
     });
     expect(resolveTerminalLaunch({}, { app: "Alacritty" }).launch).toEqual({
       kind: "openAppArgs",
@@ -1860,6 +1860,20 @@ describe("terminal launch resolution (ADR-0016)", () => {
       kind: "openApp",
       app: "Terminal",
     });
+  });
+
+  it("ghostty rides AppleScript: new tab in the front window, prompt-free command", () => {
+    const src = ghosttyTabAppleScript("Ghostty", '/ws/.zcode/tmp/tui-ab12"cd.command');
+    expect(src).toContain('tell application "Ghostty"');
+    // No windows → a fresh one; otherwise reuse the front window (no -n spawn).
+    expect(src).toContain("if (count of windows) = 0 then");
+    expect(src).toContain("set tgt to front window");
+    // The script runs via a surface configuration command — never `-e`, which
+    // trips Ghostty's per-launch "Allow Ghostty to Execute" gate.
+    expect(src).not.toContain("-e ");
+    expect(src).toContain('set command of cfg to "/bin/sh " &');
+    // AppleScript string escaping: backslash and double-quote survive.
+    expect(src).toContain('\\"cd.command');
   });
 });
 

@@ -272,6 +272,13 @@ export type TerminalLaunch =
   /** Terminals driven by their own CLI: `open -na <app> --args <args> <sh>
    * <script>` — args come first, the script program is appended. */
   | { kind: "openAppArgs"; app: string; args: string[] }
+  /** Ghostty: `-e` trips its "Allow Ghostty to Execute" security prompt on
+   * EVERY launch (GHSA-q9fg-cpmh-c78x — upstream refuses a disable switch),
+   * so the hub drives its AppleScript dictionary instead (Ghostty ≥1.3.0):
+   * a `new tab` in the front window reuses an existing window, and `command`
+   * on a surface configuration runs the script without the prompt. Only a
+   * one-time macOS Automation (TCC) grant for the hub is required. */
+  | { kind: "ghosttyScript"; app: string }
   /** Warp: refuses `.command` files and its CLI is agent-only, but its URI
    * scheme EXECUTES a script handed to action/new_tab's path param
    * (app/src/uri/mod.rs → open_file; verified on 0.2026.09.02): the hub opens
@@ -285,8 +292,10 @@ export type TerminalLaunch =
  * window: Terminal and iTerm execute `.command` files handed over via open;
  * WezTerm's `start --` runs an alternative program (wezterm.org/cli/start.html);
  * kitty takes the program as normal positional arguments
- * (sw.kovidgoyal.net/kitty/invocation); Alacritty and Ghostty support the
- * common `-e` flag; Warp rides its new_tab URI action (see warpUri above).
+ * (sw.kovidgoyal.net/kitty/invocation); Alacritty supports the common `-e`
+ * flag; Ghostty rides its AppleScript dictionary (see ghosttyScript above —
+ * its `-e` is unusable for programmatic launches); Warp rides its new_tab
+ * URI action (see warpUri above).
  * The script does its own `cd`, so no per-app cwd flags. Hyper is absent — no
  * programmatic command execution at all (vercel/hyper#3677).
  */
@@ -298,7 +307,7 @@ const TERMINAL_APP_LAUNCHERS: Record<string, TerminalLaunch> = {
   wezterm: { kind: "openAppArgs", app: "WezTerm", args: ["start", "--"] },
   kitty: { kind: "openAppArgs", app: "kitty", args: [] },
   alacritty: { kind: "openAppArgs", app: "Alacritty", args: ["-e"] },
-  ghostty: { kind: "openAppArgs", app: "Ghostty", args: ["-e"] },
+  ghostty: { kind: "ghosttyScript", app: "Ghostty" },
   warp: { kind: "warpUri", app: "Warp", scheme: "warp" },
   "warp-preview": { kind: "warpUri", app: "Warp Preview", scheme: "warppreview" },
   warp_preview: { kind: "warpUri", app: "Warp Preview", scheme: "warppreview" },
@@ -380,6 +389,34 @@ const TUI_SCRIPT_MAX_AGE_MS = 60 * 60 * 1000;
  * blinds diff/git panels. Any failure writing there (read-only workspace,
  * permissions, …) falls back to the historical mkdtemp(tmpdir()) path.
  */
+/** Escape a string for an AppleScript double-quoted literal (\\ and "). */
+function appleScriptString(s: string): string {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * The AppleScript source that opens the TUI script as a NEW TAB in Ghostty's
+ * front window (a new window only when none exists). See the ghosttyScript
+ * launcher: `command` on a surface configuration is Ghostty's trusted,
+ * prompt-free path to run a program — unlike `-e`, which trips its
+ * "Allow Ghostty to Execute" security gate on every launch.
+ */
+export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
+  return [
+    `tell application ${appleScriptString(app)}`,
+    "activate",
+    "if (count of windows) = 0 then",
+    "set tgt to new window",
+    "else",
+    "set tgt to front window",
+    "end if",
+    "set cfg to new surface configuration",
+    `set command of cfg to "/bin/sh " & ${appleScriptString(scriptPath)}`,
+    "new tab in tgt with configuration cfg",
+    "end tell",
+  ].join("\n");
+}
+
 export function writeTuiScript(workspace: string, cliJs: string, env: NodeJS.ProcessEnv): string {
   const contents = terminalTuiScript(workspace, cliJs, env);
   const dir = path.join(workspace, ".zcode", "tmp");
@@ -448,6 +485,10 @@ async function spawnTerminalTui(opts: {
     argv = ["/bin/sh", "-c", rendered];
   } else if (launch.kind === "openApp") {
     argv = ["open", "-a", launch.app, script];
+  } else if (launch.kind === "ghosttyScript") {
+    // osascript talks to the running app — a non-zero exit (pre-1.3 Ghostty,
+    // denied Automation permission) falls through to the headless bridge.
+    argv = ["osascript", "-e", ghosttyTabAppleScript(launch.app, script)];
   } else if (launch.kind === "warpUri") {
     // new_tab = Warp's default open mode (like Cmd+T: a tab in the focused
     // window; Warp opens a window first if none exists).
