@@ -677,6 +677,15 @@ async function resolveResumeTarget(
  */
 const MARTTY_RESUME_TAIL = 200;
 
+/**
+ * How many of the tail's most recent turns keep their tool records in the
+ * TUI replay. Multi-turn sessions hold hundreds of tool rows; even folded
+ * (martty's default) they scroll the conversation out of the terminal —
+ * older turns replay chat text only. Editors are unaffected (session/load
+ * replays full fidelity).
+ */
+const MARTTY_TOOL_TURN_WINDOW = 2;
+
 /** True when the connecting client is Martty, the bundled TUI frontend. */
 function isMarttyClient(server: ZcodeAcpServer): boolean {
   // Sticky flag first: clientName is last-write-wins and a remote client's
@@ -699,7 +708,9 @@ async function replayResumeHistory(
   const messages = await fetchMessages(server, zcodeSid);
   if (messages.length === 0) return;
   const slice = sliceTail(messages, MARTTY_RESUME_TAIL);
-  await withReplayBatch(acpSid, () => replayMessages(cx, acpSid, slice.batch));
+  await withReplayBatch(acpSid, () =>
+    replayMessages(cx, acpSid, slice.batch, { toolTurnWindow: MARTTY_TOOL_TURN_WINDOW }),
+  );
   log(
     `session/resume: replayed ${slice.meta.replayedMessages} messages for the TUI` +
       ` (tail ${MARTTY_RESUME_TAIL} of ${slice.meta.totalMessages} on record)`,
@@ -915,7 +926,13 @@ export async function resumeIntoSession(
   const history = await fetchMessages(server, zcodeTarget);
   if (history.length > 0) server.markSessionActive(acpSid);
   const slice = fullSlice(history);
-  await withReplayBatch(acpSid, () => replayMessages(cx, acpSid, slice.batch));
+  await withReplayBatch(acpSid, () =>
+    replayMessages(cx, acpSid, slice.batch, {
+      // TUI condensation (see MARTTY_TOOL_TURN_WINDOW) — an editor typing
+      // /resume keeps full-fidelity replay.
+      toolTurnWindow: isMarttyClient(server) ? MARTTY_TOOL_TURN_WINDOW : undefined,
+    }),
+  );
   log(`/resume: replayed ${slice.meta.replayedMessages} messages into ${acpSid.slice(0, 8)}`);
 
   // Same baseline dance as session/load: mark history seen so the next turn's

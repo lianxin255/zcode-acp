@@ -369,6 +369,18 @@ function collapseUserText(
 }
 
 /**
+ * Replay condensation options. `toolTurnWindow` keeps tool records (real
+ * tool_call parts AND the harness's rewritten tool-transcript pseudo-user
+ * text) only for the most recent N turns of the batch — older turns replay
+ * conversation text only. Built for the TUI resume tail: a multi-turn
+ * session holds hundreds of tool rows, and even folded they scroll the chat
+ * out of the terminal window. Editors pass nothing and keep full fidelity.
+ */
+export interface ReplayOptions {
+  toolTurnWindow?: number;
+}
+
+/**
  * Replay messages as session/update notifications, oldest → newest.
  *
  * MUST run inside `withReplayBatch` for the session: this is the one sender
@@ -379,9 +391,24 @@ export async function replayMessages(
   cx: acp.AgentContext,
   acpSid: string,
   messages: ZcodeMessage[],
+  opts: ReplayOptions = {},
 ): Promise<number> {
+  // 0-based turn index per message position (a turn = leading non-user
+  // messages + everything up to the next user message).
+  const starts = turnStarts(messages);
+  const turnOf = (i: number): number => {
+    let t = 0;
+    for (const s of starts) {
+      if (s <= i) t++;
+      else break;
+    }
+    return t - 1;
+  };
+  const lastTurn = starts.length - 1;
+  const toolsKept = (i: number): boolean =>
+    opts.toolTurnWindow === undefined || lastTurn - turnOf(i) < opts.toolTurnWindow;
   let replayed = 0;
-  for (const m of messages) {
+  for (const [mi, m] of messages.entries()) {
     const info = m.info ?? {};
     const role = info.role;
     const mid = info.id ?? `hist_${randomUUID().slice(0, 12)}`;
@@ -398,6 +425,7 @@ export async function replayMessages(
         const collapse =
           role === "user" ? collapseUserText(text, info.semantics, info.summary) : null;
         if (collapse) {
+          if (collapse.kind === "tool-transcript" && !toolsKept(mi)) continue;
           await cx.notify("session/update", {
             sessionId: acpSid,
             update: {
@@ -440,6 +468,7 @@ export async function replayMessages(
           });
         }
       } else if (ptype === "tool") {
+        if (!toolsKept(mi)) continue;
         const tp = p as {
           id?: string;
           tool?: string;
