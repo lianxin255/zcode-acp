@@ -245,6 +245,14 @@ export class ZcodeAcpServer {
   /** Session titles already set, to enforce set-once (acp_sid → title). */
   readonly sessionTitles = new Map<string, string>();
   /**
+   * Placeholders minted by a REMOTE-driven session/new (the hub's create-bind
+   * or any serve-mode mint). Remote clients have no editor-side session
+   * storage, so discovery advertises these in the ACTIVE session list even
+   * before the first turn (while they are still pure placeholders). Locally
+   * minted ones stay invisible until first use.
+   */
+  readonly remoteCreatedSessions = new Set<string>();
+  /**
    * Sessions verified as loaded in the CURRENT backend subprocess, with the
    * verification timestamp — populated only after a successful
    * session/create or session/resume RPC and refreshed when a turn runs. A

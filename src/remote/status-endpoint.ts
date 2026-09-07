@@ -62,6 +62,21 @@ export function collectStatus(server: ZcodeAcpServer): { sessions: SessionStatus
       updatedAt: summary.updatedAt,
     });
   }
+  // Membership parity with collectSessions: REMOTE-created empty sessions
+  // are advertised (a phone must see its own fresh session in the active
+  // list) for as long as THIS bridge — the CLI that hosts it — lives;
+  // locally minted ones stay invisible. The hand-off to the main loop is the
+  // first real turn (hasActivity), not incidental materialization — a phone
+  // attach-load creates the empty backend session without prompting.
+  for (const acpSid of server.remoteCreatedSessions) {
+    if (server.sessionSummaries.get(acpSid)?.hasActivity) continue;
+    const summary = server.sessionSummaries.get(acpSid);
+    sessions.push({
+      sessionId: acpSid,
+      status: "idle",
+      updatedAt: summary?.updatedAt ?? Date.now(),
+    });
+  }
   sessions.sort((a, b) => b.updatedAt - a.updatedAt);
   return { sessions };
 }

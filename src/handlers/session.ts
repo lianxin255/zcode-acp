@@ -268,6 +268,10 @@ export async function newSession(
         : (sanitizeClientCwd(params.cwd) ?? process.cwd());
       server.pendingSessions.set(bindSid, { cwd, mcpServers: params.mcpServers });
       server.sessionCwds.set(bindSid, cwd);
+      // Remote-created: discovery must advertise it in the ACTIVE list for
+      // as long as this bridge lives (a phone has no editor-side session
+      // storage of its own; the window closing ends the listing).
+      server.remoteCreatedSessions.add(bindSid);
       rememberLazySession(bindSid, cwd);
       server.titleEligibleSessions.add(bindSid);
       log(`session/new (create-bind) → ${bindSid} cwd=${cwd}`);
@@ -353,7 +357,8 @@ export async function newSession(
   server.sessionCwds.set(acpSid, cwd);
   // Durable alias so the placeholder survives a bridge restart and session/
   // resume can still resolve it (best-effort; failures are swallowed inside
-  // the store).
+  // the store). Serve-mode mints are remote-driven — advertise them.
+  if (server.serveMode) server.remoteCreatedSessions.add(acpSid);
   rememberLazySession(acpSid, cwd);
   // Only freshly-created sessions are eligible for auto-title on first
   // end_turn; resumed/loaded sessions already have a title and must keep it.

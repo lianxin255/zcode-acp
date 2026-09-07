@@ -26,8 +26,8 @@ import {
 } from "@agentclientprotocol/sdk/experimental/node";
 import { WebSocketServer } from "ws";
 
-import type { ZcodeAcpServer } from "../server.js";
 import { runtimeSpawnParts } from "../runtime.js";
+import type { ZcodeAcpServer } from "../server.js";
 import { AGENT_INFO, log, warn } from "../utils.js";
 import { createFileHandler } from "./file-endpoint.js";
 import { createSessionCloseHandler } from "./session-close-endpoint.js";
@@ -84,7 +84,9 @@ function tryListen(server: Server, port: number): Promise<boolean> {
  * - Accessible: every member is a registered acp→zcode mapping here, so a
  *   remote `session/load` resolves and resumes it on demand. Lazy
  *   placeholders without a backend session never ran a turn and stay
- *   invisible.
+ *   invisible — except REMOTE-created ones (`remoteCreatedSessions`), which
+ *   the phone must see in its active list right after creating them (for as
+ *   long as the hosting CLI bridge lives).
  *
  * Advertised ids are the ACP session ids the EDITOR uses (placeholder ids,
  * stable across bridges via Zed's own storage and the durable alias store) —
@@ -116,6 +118,22 @@ export async function collectSessions(server: ZcodeAcpServer): Promise<Advertise
       ...(summary.title !== undefined ? { title: summary.title } : {}),
       updatedAt: summary.updatedAt,
     });
+  }
+  // Remote-created conversations with zero turns: a phone has no editor-side
+  // session storage, so the ACTIVE list must show its own fresh session at
+  // once. Visibility is bound to the CLI bridge that hosts it (the in-memory
+  // set dies with the process): the window closing ends the empty session's
+  // list presence, while the phone app sleeping/reconnecting does not — the
+  // bridge keeps heartbeating either way. Still-pure placeholders only —
+  // once the first turn materializes it, the loop above takes over under the
+  // zcodeSid key and the skips here prevent a duplicate row. Locally minted
+  // placeholders stay invisible.
+  const advertised = new Set(Array.from(live.values(), (s) => s.sessionId));
+  for (const acpSid of server.remoteCreatedSessions) {
+    if (server.resolveSid(acpSid)) continue; // materialized — covered above
+    if (advertised.has(acpSid)) continue;
+    const summary = server.sessionSummaries.get(acpSid);
+    live.set(acpSid, { sessionId: acpSid, updatedAt: summary?.updatedAt ?? Date.now() });
   }
 
   const backend = server.backend;

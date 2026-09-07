@@ -126,6 +126,51 @@ describe("status endpoint derivation", () => {
     const base = await bootStatus(new ZcodeAcpServer());
     expect(await getStatus(base)).toEqual({ sessions: [] });
   });
+
+  it("advertises REMOTE-created pure placeholders, then de-duplicates once materialized", async () => {
+    const server = new ZcodeAcpServer();
+    seedSession(server, { title: "live" });
+    // A phone-created session: pure placeholder, no backend session yet.
+    const remote = randomUUID();
+    server.remoteCreatedSessions.add(remote);
+    server.sessionSummaries.set(remote, { updatedAt: Date.now() });
+    const base = await bootStatus(server);
+
+    const body = await getStatus(base);
+    expect(body.sessions.map((s) => s.sessionId)).toContain(remote);
+
+    // First turn materializes it: the normal path takes over under the
+    // zcodeSid key and the placeholder row must not duplicate it.
+    server.registerSession(remote, "zc-remote");
+    server.markSessionActive(remote);
+    const after = await getStatus(base);
+    expect(after.sessions.filter((s) => s.sessionId === remote)).toHaveLength(1);
+  });
+
+  it("keeps advertising a remote session after incidental MATERIALIZATION (attach-load, no prompt)", async () => {
+    const server = new ZcodeAcpServer();
+    const remote = randomUUID();
+    server.remoteCreatedSessions.add(remote);
+    server.sessionSummaries.set(remote, { updatedAt: Date.now() });
+    // A phone attach-load materializes the empty backend session
+    // (registerSession / touchSessionSummary) without ever prompting —
+    // hasActivity stays false and the row must NOT vanish between the
+    // placeholder and main loops.
+    server.registerSession(remote, "zc-empty");
+    const base = await bootStatus(server);
+
+    const body = await getStatus(base);
+    expect(body.sessions.filter((s) => s.sessionId === remote)).toHaveLength(1);
+  });
+
+  it("keeps a LOCAL never-used placeholder invisible", async () => {
+    const server = new ZcodeAcpServer();
+    const local = randomUUID();
+    server.sessionSummaries.set(local, { updatedAt: Date.now() });
+    const base = await bootStatus(server);
+
+    expect(await getStatus(base)).toEqual({ sessions: [] });
+  });
 });
 
 describe("status endpoint HTTP handling", () => {
