@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0](https://github.com/william0wang/zcode-acp/compare/v0.27.3...v0.28.0) (2026-09-07)
+
+
+### Features
+
+* **remote:** launch Ghostty TUI via AppleScript new tab, bypassing its -e confirm gate ([229da20](https://github.com/william0wang/zcode-acp/commit/229da208887c16cbfa2ddd29910d39941d53ae98))
+* **remote:** show phone-created empty sessions in the active list while their CLI bridge lives ([9d19d3e](https://github.com/william0wang/zcode-acp/commit/9d19d3e616e85f9db2aae6b7caa3d4e56895989f))
+* **tui:** condense replayed tool records to the most recent turns in the CLI resume replay ([0ee1064](https://github.com/william0wang/zcode-acp/commit/0ee10641112c863011a8afca9ad9977d7bdbf503))
+
 ## [0.27.3](https://github.com/william0wang/zcode-acp/compare/v0.27.2...v0.27.3) (2026-09-07)
 
 
