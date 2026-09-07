@@ -18,6 +18,8 @@ import {
 
 const mockFiles = new Map<string, string>();
 const mockDirs = new Set<string>();
+/** Explicit mtimes for files the sweep's statSync consults (absent = now). */
+const mockMtimes = new Map<string, number>();
 const STORE = "/fake-home/.zcode/v2/acp-lazy-sessions.json";
 
 vi.mock("node:fs", async () => {
@@ -33,6 +35,17 @@ vi.mock("node:fs", async () => {
       mockDirs.add(path.dirname(p));
       mockFiles.set(p, String(data));
     },
+    renameSync: (from: string, to: string) => {
+      mockFiles.set(to, mockFiles.get(from) ?? "");
+      mockFiles.delete(from);
+    },
+    readdirSync: (d: string) =>
+      [...mockFiles.keys()].filter((k) => path.dirname(k) === d).map((k) => path.basename(k)),
+    statSync: (p: string) => ({ mtimeMs: mockMtimes.get(p) ?? Date.now() }),
+    unlinkSync: (p: string) => {
+      mockFiles.delete(p);
+      mockMtimes.delete(p);
+    },
     mkdirSync: (p: string) => {
       mockDirs.add(String(p));
     },
@@ -42,6 +55,7 @@ vi.mock("node:fs", async () => {
 beforeEach(() => {
   mockFiles.clear();
   mockDirs.clear();
+  mockMtimes.clear();
   vi.stubEnv("HOME", "/fake-home");
 });
 
@@ -79,5 +93,42 @@ describe("lazy session alias store", () => {
     mockFiles.set(STORE, "{not json");
 
     expect(lookupLazySession("acp_1")).toBeUndefined();
+  });
+
+  it("writes atomically — no .tmp leftovers at the store path", () => {
+    rememberLazySession("acp_1", "/tmp/ws");
+    recordMaterializedSession("acp_1", "sess_1", "/tmp/ws");
+
+    const paths = [...mockFiles.keys()];
+    expect(paths).toEqual([STORE]);
+    // The final content is complete, parseable JSON.
+    expect(() => JSON.parse(mockFiles.get(STORE)!)).not.toThrow();
+  });
+
+  it("merges over the on-disk table, preserving a concurrent writer's record", () => {
+    // Process A's placeholder…
+    rememberLazySession("acp_a", "/tmp/ws");
+    // …then process B replaces the file wholesale (its own snapshot). Process
+    // A's next write must re-read and keep B's record, not clobber it.
+    mockFiles.set(STORE, JSON.stringify({ acp_b: { cwd: "/tmp/other", createdAt: Date.now() } }));
+
+    rememberLazySession("acp_c", "/tmp/third");
+
+    const table = JSON.parse(mockFiles.get(STORE)!) as Record<string, { cwd: string }>;
+    expect(Object.keys(table).sort()).toEqual(["acp_b", "acp_c"]);
+  });
+
+  it("sweeps stale atomic-write tmp leftovers on the next persist", () => {
+    const stale = `${STORE}.tmp-999`;
+    const fresh = `${STORE}.tmp-123`;
+    mockFiles.set(stale, "{}");
+    mockFiles.set(fresh, "{}");
+    mockMtimes.set(stale, Date.now() - 2 * 60 * 60 * 1000); // 2h old — sweep
+    mockMtimes.set(fresh, Date.now()); // a live writer's tmp — keep
+
+    rememberLazySession("acp_1", "/tmp/ws");
+
+    expect(mockFiles.has(stale)).toBe(false);
+    expect(mockFiles.has(fresh)).toBe(true);
   });
 });
