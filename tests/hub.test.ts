@@ -774,6 +774,7 @@ describe("hub version self-upgrade", () => {
   it("restarts when a newer bridge registers", async () => {
     let exited = false;
     const hub = await startTestHub({
+      staleVoteCooldownMs: 0,
       onIdleExit: () => {
         exited = true;
       },
@@ -838,15 +839,39 @@ describe("hub fingerprint self-upgrade", () => {
     });
   }
 
-  it("restarts when a bridge with a different (lexically higher) fingerprint registers", async () => {
+  it("NEVER restarts on a differing fingerprint (votes are version-only)", async () => {
+    // Regression (live incident 2026-09-08): a coexisting dist's fingerprint
+    // voted every respawned hub stale — a non-converging ~5s restart churn
+    // that wiped all instances ("sessions flash then disappear"). A hash has
+    // no ordering; it can never prove "newer". Fingerprint comparison lives
+    // in /api/upgrade only (hub vs DISK, self-negating by construction).
     let restarted = false;
     const hub = await startTestHub({
-      hubFingerprint: "aaaa",
+      hubFingerprint: "7d05",
+      staleVoteCooldownMs: 0,
       onRestart: () => {
         restarted = true;
       },
     });
-    const res = await register(hub, { codeFingerprint: "bbbb" });
+    for (const fp of ["bbbb", "aaaa", "fcf69ae4e10f"]) {
+      const res = await register(hub, { codeFingerprint: fp });
+      expect(await res.json()).toEqual({ ok: true });
+    }
+    await new Promise((r) => setTimeout(r, 800));
+    expect(restarted).toBe(false);
+    expect((await fetch(`http://127.0.0.1:${hub.port}/api/health`)).status).toBe(200);
+  });
+
+  it("restarts for a strictly newer VERSION even when both sides have fingerprints", async () => {
+    let restarted = false;
+    const hub = await startTestHub({
+      hubFingerprint: "aaaa",
+      staleVoteCooldownMs: 0,
+      onRestart: () => {
+        restarted = true;
+      },
+    });
+    const res = await register(hub, { version: "9999.0.0", codeFingerprint: "bbbb" });
     expect(await res.json()).toEqual({ ok: true, restarting: true });
     await withTimeout(
       new Promise<void>((resolve) => {
@@ -858,45 +883,16 @@ describe("hub fingerprint self-upgrade", () => {
         }, 50);
       }),
       5000,
-      "hub restart onto higher fingerprint",
+      "hub restart onto newer version",
     );
   });
 
-  it("does not ping-pong for a lexically LOWER fingerprint (stable winner)", async () => {
+  it("suppresses newer-bridge votes during the restart cooldown", async () => {
+    // Loop breaker: a hub that just (re)started ignores stale votes for the
+    // cooldown window — a same-age respawn can never be voted into a churn.
     let restarted = false;
     const hub = await startTestHub({
-      hubFingerprint: "bbbb",
-      onRestart: () => {
-        restarted = true;
-      },
-    });
-    const res = await register(hub, { codeFingerprint: "aaaa" });
-    expect(await res.json()).toEqual({ ok: true });
-    await new Promise((r) => setTimeout(r, 800));
-    expect(restarted).toBe(false);
-  });
-
-  it("does not restart for an identical fingerprint", async () => {
-    let restarted = false;
-    const hub = await startTestHub({
-      hubFingerprint: "aaaa",
-      onRestart: () => {
-        restarted = true;
-      },
-    });
-    const res = await register(hub, { codeFingerprint: "aaaa" });
-    expect(await res.json()).toEqual({ ok: true });
-    await new Promise((r) => setTimeout(r, 800));
-    expect(restarted).toBe(false);
-  });
-
-  it("ignores the version signal once this hub knows its fingerprint", async () => {
-    // A fingerprint-less bridge claiming a huge version must not restart a
-    // fingerprinted hub: the transition case (old bridge vs new hub) is the
-    // /api/upgrade postinstall poke's job, never the register path's.
-    let restarted = false;
-    const hub = await startTestHub({
-      hubFingerprint: "aaaa",
+      staleVoteCooldownMs: 60_000,
       onRestart: () => {
         restarted = true;
       },
@@ -905,6 +901,7 @@ describe("hub fingerprint self-upgrade", () => {
     expect(await res.json()).toEqual({ ok: true });
     await new Promise((r) => setTimeout(r, 800));
     expect(restarted).toBe(false);
+    expect((await fetch(`http://127.0.0.1:${hub.port}/api/health`)).status).toBe(200);
   });
 });
 
@@ -1097,7 +1094,12 @@ describe("hub remote session-create (ADR-0014)", () => {
    * once(); the mutable exitCode/signalCode fields flip the death checks.
    */
   let fakeChild: EventEmitter & { pid: number; exitCode: number | null; signalCode: string | null };
-  let spawnCalls: Array<{ cwd: string; env: NodeJS.ProcessEnv; kind: "tui" | "serve" }>;
+  let spawnCalls: Array<{
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    kind: "tui" | "serve";
+    launch?: unknown;
+  }>;
   let spawnCount: number;
 
   beforeEach(() => {
@@ -1115,7 +1117,12 @@ describe("hub remote session-create (ADR-0014)", () => {
   });
 
   function spawnServeSpy() {
-    return (opts: { cwd: string; env: NodeJS.ProcessEnv; kind: "tui" | "serve" }) => {
+    return (opts: {
+      cwd: string;
+      env: NodeJS.ProcessEnv;
+      kind: "tui" | "serve";
+      launch?: unknown;
+    }) => {
       spawnCount++;
       spawnCalls.push(opts);
       return fakeChild as unknown as import("node:child_process").ChildProcess;
@@ -1620,7 +1627,12 @@ describe("hub terminal-TUI session resume (ADR-0017)", () => {
     });
 
   let fakeChild: EventEmitter & { pid: number; exitCode: number | null; signalCode: string | null };
-  let spawnCalls: Array<{ cwd: string; env: NodeJS.ProcessEnv; kind: "tui" | "serve" }>;
+  let spawnCalls: Array<{
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    kind: "tui" | "serve";
+    launch?: unknown;
+  }>;
 
   beforeEach(() => {
     listKnownWorkspacesMock.mockReset();
@@ -1638,7 +1650,8 @@ describe("hub terminal-TUI session resume (ADR-0017)", () => {
     cwd: string;
     env: NodeJS.ProcessEnv;
     kind: "tui" | "serve";
-  }) => import("node:child_process").ChildProcess {
+    launch?: unknown;
+  }) => import("node:child_process").ChildProcess | null {
     return (opts) => {
       spawnCalls.push(opts);
       return fakeChild as unknown as import("node:child_process").ChildProcess;
@@ -1822,7 +1835,12 @@ describe("hub terminal-TUI session create (session binding + slow-window fallbac
     });
 
   let fakeChild: EventEmitter & { pid: number; exitCode: number | null; signalCode: string | null };
-  let spawnCalls: Array<{ cwd: string; env: NodeJS.ProcessEnv; kind: "tui" | "serve" }>;
+  let spawnCalls: Array<{
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    kind: "tui" | "serve";
+    launch?: unknown;
+  }>;
 
   beforeEach(() => {
     listKnownWorkspacesMock.mockReset();
@@ -1836,13 +1854,23 @@ describe("hub terminal-TUI session create (session binding + slow-window fallbac
     spawnCalls = [];
   });
 
-  function spawnServeSpy(): (opts: {
+  function spawnServeSpy(
+    /** When set, its return decides opened (child) vs failed launch (null). */
+    respond?: (opts: {
+      cwd: string;
+      env: NodeJS.ProcessEnv;
+      kind: "tui" | "serve";
+      launch?: unknown;
+    }) => import("node:child_process").ChildProcess | null,
+  ): (opts: {
     cwd: string;
     env: NodeJS.ProcessEnv;
     kind: "tui" | "serve";
-  }) => import("node:child_process").ChildProcess {
+    launch?: unknown;
+  }) => import("node:child_process").ChildProcess | null {
     return (opts) => {
       spawnCalls.push(opts);
+      if (respond) return respond(opts);
       return fakeChild as unknown as import("node:child_process").ChildProcess;
     };
   }
@@ -1907,6 +1935,82 @@ describe("hub terminal-TUI session create (session binding + slow-window fallbac
     const res = await post(hub, { workspacePath: PROJECT });
     expect(res.status).toBe(502);
     expect(await res.text()).toBe("serve bridge did not register in time");
+  });
+
+  it("walks down the terminal list at the registration timeout before going headless", async () => {
+    // Locked-screen Ghostty: the tab opens (launch succeeded) but its surface
+    // init died, so the TUI never registers. The NEXT preference gets a fresh
+    // budget; headless comes only after the list is exhausted (one rescue).
+    const launches = [
+      { kind: "openApp", app: "Ghostty" },
+      { kind: "openApp", app: "Warp" },
+    ];
+    const hub = await startTestHub({
+      spawnServe: spawnServeSpy(),
+      tuiRegisterTimeoutMs: 500,
+      terminalLaunches: launches as never,
+    });
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 700)); // first budget burns out
+    expect(spawnCalls).toHaveLength(2);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    expect(spawnCalls[0]!.launch).toEqual(launches[0]);
+    expect(spawnCalls[1]!.kind).toBe("tui");
+    expect(spawnCalls[1]!.launch).toEqual(launches[1]);
+    // The second window registers: the SAME nonce satisfies the incubation.
+    await registerServeBridge(hub, "window-2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "window-2", reused: false });
+  });
+
+  it("rescues headlessly only once after every terminal preference failed", async () => {
+    const launches = [{ kind: "openApp", app: "Ghostty" }];
+    const hub = await startTestHub({
+      spawnServe: spawnServeSpy(),
+      tuiRegisterTimeoutMs: 500,
+      terminalLaunches: launches as never,
+    });
+    const pending = post(hub, { workspacePath: PROJECT });
+    // First timeout: list exhausted → headless rescue (2nd spawn, kind serve).
+    await new Promise((r) => setTimeout(r, 700));
+    expect(spawnCalls).toHaveLength(2);
+    expect(spawnCalls[1]!.kind).toBe("serve");
+    // Rescue registers → answered; the incubation is settled, so no third
+    // spawn even though the rescue's own budget also expires unanswered.
+    await registerServeBridge(hub, "rescued", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "rescued", reused: false });
+    await new Promise((r) => setTimeout(r, 700));
+    expect(spawnCalls).toHaveLength(2);
+  });
+
+  it("skips a terminal whose launch fails and answers with a later preference", async () => {
+    const launches = [
+      { kind: "openApp", app: "Broken" },
+      { kind: "openApp", app: "Warp" },
+    ];
+    const hub = await startTestHub({
+      // First launch fails to open (null) — the walk continues at once,
+      // without waiting for any registration budget.
+      spawnServe: spawnServeSpy((opts) =>
+        opts.launch && (opts.launch as { app: string }).app === "Broken"
+          ? null
+          : (fakeChild as unknown as import("node:child_process").ChildProcess),
+      ),
+      tuiRegisterTimeoutMs: 5_000,
+      terminalLaunches: launches as never,
+    });
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(spawnCalls).toHaveLength(2);
+    expect(spawnCalls[0]!.launch).toEqual(launches[0]);
+    expect(spawnCalls[1]!.launch).toEqual(launches[1]);
+    await registerServeBridge(hub, "warp-window", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "warp-window", reused: false });
   });
 });
 
@@ -2099,7 +2203,7 @@ describe("hub instance shutdown", () => {
       5000,
       "dummy bridge exit",
     );
-  });
+  }, 15_000);
 
   it("refuses an editor-origin bridge without a nonce (403)", async () => {
     const hub = await startTestHub();

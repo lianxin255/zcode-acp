@@ -122,14 +122,31 @@ export interface HubOptions {
    * dist/cli.js — an interactive TUI in a visible terminal for
    * session-create and session-resume ("tui"; resume carries the requested
    * session in ZCODE_ACP_RESUME_SESSION), a detached headless serve bridge
-   * for background queries ("serve").
+   * for background queries ("serve"). A "tui" attempt returns null when the
+   * launch fails; the caller then walks down the terminal preference list
+   * (terminalLaunches) and only spawns "serve" once every entry failed.
    */
   spawnServe?: (opts: {
     cwd: string;
     env: NodeJS.ProcessEnv;
     /** "tui" = visible terminal (session-create/-resume); "serve" = detached headless. */
     kind: "tui" | "serve";
-  }) => ChildProcess | Promise<ChildProcess>;
+    /** The resolved launch for a "tui" attempt (one list entry). */
+    launch?: TerminalLaunch;
+  }) => ChildProcess | null | Promise<ChildProcess | null>;
+  /**
+   * Override the ordered terminal preference list the create/resume
+   * incubation walks (tests inject fixed entries). Default: resolved LIVE
+   * per incubation from remoteTerminalPrefs (config file > env), so editing
+   * the file takes effect without a hub restart.
+   */
+  terminalLaunches?: TerminalLaunch[];
+  /**
+   * How long after startup the hub ignores newer-bridge stale votes (tests
+   * shrink to 0). Default STALE_VOTE_COOLDOWN_MS — the loop breaker so a
+   * same-age respawn can never be voted into a restart churn.
+   */
+  staleVoteCooldownMs?: number;
 }
 
 export interface HubHandle {
@@ -249,6 +266,13 @@ function validSessions(raw: unknown): SessionSummary[] | null {
 /** How long POST /api/instances waits for the spawned bridge to register. */
 const SERVE_REGISTER_TIMEOUT_MS = 10_000;
 const SERVE_REGISTER_POLL_MS = 300;
+/**
+ * A freshly started hub ignores newer-bridge stale votes for this long —
+ * the loop breaker for a restart that re-spawned a hub of the same age
+ * (the vote would otherwise fire again immediately; at most one restart
+ * per cooldown window).
+ */
+const STALE_VOTE_COOLDOWN_MS = 60_000;
 
 /** Register-origin parser: only "serve" is special; anything else is "editor". */
 function parseOrigin(raw: unknown): "editor" | "serve" {
@@ -343,15 +367,31 @@ export function resolveTerminalLaunch(
   launch: TerminalLaunch;
   warning?: string;
 } {
-  if (prefs.command) return { launch: { kind: "shell", command: prefs.command } };
-  const raw = prefs.app ?? "";
-  const name = raw
-    .toLowerCase()
-    .replace(/\.app$/, "")
-    .replace(/\s+/g, "-");
-  const launcher = TERMINAL_APP_LAUNCHERS[name];
-  if (launcher) return { launch: launcher };
-  return { launch: { kind: "openApp", app: raw || "Terminal" } };
+  const launches = resolveTerminalLaunches(prefs);
+  return { launch: launches[0] ?? { kind: "openApp", app: "Terminal" } };
+}
+
+/**
+ * The ORDERED terminal preference list (ADR-0016 amendment): the hub walks
+ * it when a window fails — a launch that errors moves down the list at
+ * once, a window that never registers moves down at its registration
+ * timeout — and only the exhaustion of every entry falls back to headless.
+ * Resolution per entry mirrors resolveTerminalLaunch: the explicit command
+ * template (the universal escape hatch) replaces the whole list; otherwise
+ * a built-in launcher by normalized app name, else `open -a` passthrough.
+ * Disabled prefs resolve to [] (no visible-terminal attempts at all).
+ */
+export function resolveTerminalLaunches(prefs: TerminalPrefs): TerminalLaunch[] {
+  if (prefs.enabled === false) return [];
+  if (prefs.command) return [{ kind: "shell", command: prefs.command }];
+  const names = prefs.terminals?.length ? prefs.terminals : prefs.app ? [prefs.app] : ["Terminal"];
+  return names.map((raw) => {
+    const name = raw
+      .toLowerCase()
+      .replace(/\.app$/, "")
+      .replace(/\s+/g, "-");
+    return TERMINAL_APP_LAUNCHERS[name] ?? { kind: "openApp", app: raw };
+  });
 }
 
 /**
@@ -478,30 +518,25 @@ export function writeTuiScript(workspace: string, cliJs: string, env: NodeJS.Pro
 /**
  * Spawn session-create as a VISIBLE interactive TUI (ADR-0016): write a
  * throwaway .command script (`cd <project> && exec node cli.js`) and hand it
- * to a terminal (resolveTerminalLaunch) — the user gets a real terminal
- * window running the local CLI instead of an invisible daemon. The TUI's
- * bridge child inherits the remote ENV, so the incubation registers exactly
- * like a serve bridge; closing the window ends the bridge (its lifetime
- * follows the terminal, the ADR-0001 anchor). Returns null when a terminal
- * can't be used — platform, gated off via ZCODE_ACP_HUB_TERMINAL, or the
- * open failing (headless/SSH) — and the caller falls back to the detached
- * serve spawn.
+ * to ONE resolved terminal launch — the user gets a real terminal window
+ * running the local CLI instead of an invisible daemon. The TUI's bridge
+ * child inherits the remote ENV, so the incubation registers exactly like a
+ * serve bridge; closing the window ends the bridge (its lifetime follows
+ * the terminal, the ADR-0001 anchor). Returns null when the launch fails —
+ * platform without GUI support or the open erroring (pre-1.3 Ghostty,
+ * denied Automation permission) — and the CALLER walks down the terminal
+ * preference list, falling back to the detached serve spawn only after the
+ * list is exhausted.
  */
 async function spawnTerminalTui(opts: {
   cwd: string;
   env: NodeJS.ProcessEnv;
+  launch: TerminalLaunch;
 }): Promise<ChildProcess | null> {
   if (process.platform !== "darwin") return null;
-  // Terminal prefs are read LIVE here (config file first, env fallback): the
-  // hub outlives the shells that configured it, and its birth env rotates
-  // between GUI editors and interactive shells — only the file is stable.
-  // Set remote.terminal.enabled=false in ~/.config/zcode-acp/config.json (or
-  // ZCODE_ACP_HUB_TERMINAL=0) to keep remote session-create headless.
-  if (!remoteTerminalPrefs(process.env).enabled) return null;
   const cliJs = fileURLToPath(new URL("../cli.js", import.meta.url));
   const script = writeTuiScript(opts.cwd, cliJs, opts.env);
-  const { launch, warning } = resolveTerminalLaunch(process.env);
-  if (warning) warn(`hub: ${warning}`);
+  const { launch } = opts;
   let argv: string[];
   if (launch.kind === "shell") {
     const rendered = launch.command.includes("{script}")
@@ -579,14 +614,20 @@ async function spawnTerminalTui(opts: {
  * detached headless serve bridge otherwise (the ADR-0014 original — also the
  * fallback whenever the terminal window can't be opened).
  */
+/**
+ * One spawn attempt. "tui" = one resolved terminal launch (returns null when
+ * the launch fails — the caller walks the preference list); "serve" = the
+ * detached headless bridge (the documented no-GUI fallback, ADR-0014).
+ */
 async function defaultSpawnServe(opts: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   kind: "tui" | "serve";
-}): Promise<ChildProcess> {
+  launch?: TerminalLaunch;
+}): Promise<ChildProcess | null> {
   if (opts.kind === "tui") {
-    const viaTerminal = await spawnTerminalTui(opts);
-    if (viaTerminal) return viaTerminal;
+    if (!opts.launch) return null;
+    return spawnTerminalTui(opts as typeof opts & { launch: TerminalLaunch });
   }
   // dist/remote/hub-server.js → dist/cli.js (one level up).
   const cliJs = fileURLToPath(new URL("../cli.js", import.meta.url));
@@ -880,6 +921,8 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     projectsDbPath,
     stayAliveCheck = () => remoteEnabledLive(),
     spawnServe = defaultSpawnServe,
+    terminalLaunches,
+    staleVoteCooldownMs = STALE_VOTE_COOLDOWN_MS,
   } = options;
 
   /** Frozen at hub start — the anchor the /api/upgrade signals compare to. */
@@ -1013,29 +1056,89 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // (terminals otherwise name the tab after the process, "node").
       env.ZCODE_ACP_TAB_TITLE = tabTitle ?? path.basename(workspacePath);
     }
+    // Terminal preference list (ADR-0016 amendment): visible-terminal kinds
+    // walk it — a failed launch moves down at once, a window that never
+    // registers moves down at its timeout — and only the exhausted list
+    // falls back to the detached headless spawn. "serve" never pops a window.
+    const launches =
+      kind === "serve"
+        ? []
+        : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(process.env)));
+    let li = 0;
+    /**
+     * Try launches[li..] until one OPENS; advance li past every failure and
+     * leave it parked on the first opened attempt's successor. null = the
+     * remaining list failed/exhausted (caller falls back to headless).
+     */
+    const openNextTerminal = async (): Promise<ChildProcess | null> => {
+      while (li < launches.length) {
+        const attempt = launches[li]!;
+        li++;
+        try {
+          const opened = await spawnServe({
+            cwd: workspacePath,
+            kind: "tui",
+            env,
+            launch: attempt,
+          });
+          if (opened) {
+            opened.once("error", (e: Error) => {
+              spawnError = e;
+            });
+            spawnError = null;
+            log(
+              `hub: spawned terminal TUI via ${
+                attempt.kind === "shell"
+                  ? "command template"
+                  : attempt.kind === "ghosttyScript"
+                    ? `Ghostty (${attempt.app})`
+                    : attempt.kind === "warpUri"
+                      ? `Warp (${attempt.app})`
+                      : `open -a ${attempt.app}`
+              } for ${workspacePath} (pid ${opened.pid})`,
+            );
+            return opened;
+          }
+          warn(
+            `hub: terminal launch ${li}/${launches.length} failed to open — trying the next preference`,
+          );
+        } catch (e) {
+          warn(`hub: terminal launch threw: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      return null;
+    };
     try {
-      // Resume shares session-create's visible-terminal surface (and its
-      // detached-serve fallback for headless machines); only a background
-      // listing spawns the headless form — it must never pop a window.
-      child = await spawnServe({
-        cwd: workspacePath,
-        kind: kind === "serve" ? "serve" : "tui",
-        env,
-      });
-      child.once("error", (e: Error) => {
-        spawnError = e;
-      });
+      const opened = await openNextTerminal();
+      if (opened) {
+        child = opened;
+      } else {
+        // Resume shares session-create's visible-terminal surface (and its
+        // detached-serve fallback for headless machines); only a background
+        // listing spawns the headless form — it must never pop a window.
+        const spawned = await spawnServe({
+          cwd: workspacePath,
+          kind: "serve",
+          env,
+        });
+        if (!spawned) throw new Error("headless spawn returned null");
+        child = spawned;
+        child.once("error", (e: Error) => {
+          spawnError = e;
+        });
+      }
     } catch (e) {
       warn(`hub: serve spawn failed: ${e instanceof Error ? e.message : String(e)}`);
       throw new Error("serve bridge spawn failed");
     }
     log(
-      `hub: spawned ${
-        kind === "resume" ? "resume TUI" : kind === "tui" ? "terminal TUI" : "serve bridge"
-      } for ${workspacePath} (pid ${child.pid})`,
+      `hub: incubating ${kind === "resume" ? "resume TUI" : kind === "tui" ? "terminal TUI" : "serve bridge"} for ${workspacePath} (pid ${child.pid})`,
     );
     const budget = kind === "serve" ? SERVE_REGISTER_TIMEOUT_MS : tuiRegisterTimeoutMs;
-    const deadline = Date.now() + budget;
+    let deadline = Date.now() + budget;
+    // One headless rescue per incubation — a second timeout means the rescue
+    // bridge also failed to register, and retrying again just burns time.
+    let rescued = false;
     // A visible-terminal incubation (create OR resume) runs NEXT TO the serve
     // bridge the listing already incubated, and several incubations can race
     // for one workspace: the poll matches only a registration that is neither
@@ -1079,6 +1182,50 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
             );
             return { id: fallback.id, reused: true };
           }
+        }
+        // Next terminal preference: the window opened but never registered —
+        // on a locked/display-asleep screen Ghostty's AppleScript tab opens
+        // fine but its surface init fails (error.OutOfMemory, ghostty
+        // #10712), leaving the tab dead on its error page (the fake child
+        // never exits, so the fast-fail above can't fire). Walk down the
+        // user's list with a fresh budget before giving up on windows.
+        if (kind !== "serve" && li < launches.length) {
+          warn(
+            `hub: terminal TUI for ${workspacePath} never registered — trying the next terminal preference`,
+          );
+          const next = await openNextTerminal();
+          if (next) {
+            deadline = Date.now() + budget;
+            continue;
+          }
+        }
+        // Headless rescue (once, after the terminal list is exhausted):
+        // spawn the SAME incubation headlessly — the session-bind env rides
+        // along (create's pre-generated id, resume's target) and the nonce is
+        // unchanged, so this very loop matches the rescue bridge's
+        // registration and answers with a working session either way.
+        if (kind !== "serve" && !rescued) {
+          rescued = true;
+          warn(
+            `hub: ${kind === "resume" ? "resume TUI" : "terminal TUI"} for ${workspacePath} ` +
+              `never registered — rescuing the request with a headless serve bridge`,
+          );
+          try {
+            const rescuedChild = await spawnServe({ cwd: workspacePath, kind: "serve", env });
+            if (!rescuedChild) throw new Error("rescue spawn returned null");
+            child = rescuedChild;
+            child.once("error", (e: Error) => {
+              spawnError = e;
+            });
+            spawnError = null;
+          } catch (e) {
+            warn(
+              `hub: headless rescue spawn failed: ${e instanceof Error ? e.message : String(e)}`,
+            );
+            throw new Error("serve bridge did not register in time");
+          }
+          deadline = Date.now() + budget;
+          continue;
         }
         warn(`hub: serve bridge for ${workspacePath} never registered`);
         throw new Error("serve bridge did not register in time");
@@ -1748,39 +1895,35 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         instances.delete(id);
         idleSince = null; // re-arm the idle clock on membership change
       }
-      // Self-upgrade: a bridge running DIFFERENT code than this hub just
-      // registered, so this process is stale. Reply first (the bridge
-      // re-spawns the hub from its own dist when it sees `restarting`), then
-      // exit. Fingerprints are compared when both sides have one — content
-      // cannot lie the way a version frozen from package.json can (a hub
-      // born between a release merge and the dist rebuild). The lexical
-      // tie-break (bridge fp must sort HIGHER) gives coexisting dists on one
-      // machine a stable winner, so two differently-built bridges can never
-      // ping-pong the hub. Bridges without a fingerprint fall back to the
-      // legacy strictly-newer version check.
-      const bridgeFingerprint =
-        typeof body.codeFingerprint === "string" && body.codeFingerprint
-          ? body.codeFingerprint
-          : null;
-      const fingerprintStale =
-        bridgeFingerprint !== null &&
-        hubFingerprint !== null &&
-        bridgeFingerprint !== hubFingerprint &&
-        bridgeFingerprint > hubFingerprint;
-      const versionStale =
-        bridgeFingerprint === null &&
-        hubFingerprint === null &&
-        typeof body.version === "string" &&
-        compareVersions(body.version, AGENT_INFO.version) > 0;
-      const stale = url.pathname === "/api/register" && (fingerprintStale || versionStale);
+      // Self-upgrade: a bridge with a strictly NEWER VERSION just registered,
+      // so this process is stale. Reply first (the bridge re-spawns the hub
+      // from its own dist when it sees `restarting`), then exit.
+      //
+      // Content fingerprints are deliberately NOT a vote signal: a hash has
+      // no ordering (a lexically-higher fingerprint can be OLDER code), and
+      // the hub's respawn source is not guaranteed to be the voting bridge's
+      // dist — differing fingerprints could only ever produce a
+      // non-converging restart loop (observed live: a coexisting dist voted
+      // every respawned hub stale, ~5s churn, all instances wiped).
+      // Fingerprint comparison belongs to /api/upgrade ONLY, where the
+      // comparison target is the DISK a respawn would load — self-negating
+      // by construction.
+      //
+      // Cooldown: a fresh hub ignores stale votes for the first minute. If
+      // the respawn race ever produces another same-age hub, this breaks the
+      // loop — at most one restart per STALE_VOTE_COOLDOWN_MS.
+      const newerVersion =
+        typeof body.version === "string" && compareVersions(body.version, AGENT_INFO.version) > 0;
+      const cooledDown = Date.now() - startedAt > staleVoteCooldownMs;
+      const stale = url.pathname === "/api/register" && newerVersion && cooledDown;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(stale ? { ok: true, restarting: true } : { ok: true }));
       if (stale) {
         restartSoon(
-          fingerprintStale
-            ? `hub: bridge fingerprint ${bridgeFingerprint!.slice(0, 12)} differs from hub ${hubFingerprint!.slice(0, 12)} — restarting to upgrade`
-            : `hub: bridge ${body.version} is newer than hub ${AGENT_INFO.version} — restarting to upgrade`,
+          `hub: bridge ${body.version} is newer than hub ${AGENT_INFO.version} — restarting to upgrade`,
         );
+      } else if (url.pathname === "/api/register" && newerVersion && !cooledDown) {
+        log("hub: newer-bridge vote ignored (restart cooldown after a recent restart)");
       }
       return;
     }
